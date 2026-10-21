@@ -54,6 +54,20 @@ type TrajectoryData = {
   rz?: number;
 };
 
+type BallMoveData = {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  rx?: number;
+  rz?: number;
+  clientTime?: number;
+  sequence?: number;
+  prediction?: boolean;
+};
+
 const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "10kb" }));
@@ -79,11 +93,12 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     game: "Futebol de Quebrada",
-    authority: "server-authoritative-with-client-prediction",
+    authority: "server-validated-with-ball-move-sync",
     multiplayer: true,
     physics: "server-validated",
     prediction: true,
-    sharedBall: true
+    sharedBall: true,
+    ballMoveSync: true
   });
 });
 
@@ -121,6 +136,15 @@ const CONTACT_DISTANCE_ALLOWANCE = 0.35;
 const MAX_KICK_POWER = 1;
 const TRAJECTORY_LEASE_MS = 180;
 const MAX_TRAJECTORY_SPEED = 35;
+
+// A transmissão contínua da bola usa um intervalo separado dos chutes.
+// Os clientes podem enviar previsões, mas não podem sobrescrever livremente
+// a posição oficial da bola nem anular um chute confirmado.
+const BALL_MOVE_MIN_INTERVAL_MS = 20;
+const BALL_MOVE_MAX_DISTANCE_PER_PACKET = 1.6;
+const BALL_MOVE_MAX_POSITION_ERROR = 2.5;
+const BALL_MOVE_MAX_VELOCITY_ERROR = 18;
+const BALL_MOVE_IDLE_VELOCITY = 0.35;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -173,9 +197,14 @@ class MatchRoom extends Room {
   private lastContactAt: Record<string, number> = {};
   private lastContactSequence: Record<string, number> = {};
   private lastTrajectorySequence: Record<string, number> = {};
+
+  private lastBallMoveAt: Record<string, number> = {};
+  private lastBallMoveSequence: Record<string, number> = {};
+
   private simulationAccumulator = 0;
   private lastBallBroadcastAt = 0;
   private lastPlayersBroadcastAt = 0;
+  private lastBallMoveOwner = "";
 
   onCreate() {
     this.setMetadata({
@@ -198,14 +227,20 @@ class MatchRoom extends Room {
       }
     );
 
-    // Importante:
-    // O cliente NÃO pode substituir a trajetória oficial da bola.
-    // Ele pode prever a bola visualmente, mas a física compartilhada
-    // continua sendo simulada e validada pelo servidor.
     this.onMessage(
       "ball-trajectory",
       (client: Client, data: Partial<TrajectoryData>) => {
         this.handleTrajectory(client, data);
+      }
+    );
+
+    // Novo caminho de sincronização contínua da bola.
+    // O HTML transmite posição e velocidade em paralelo ao movimento
+    // do jogador. O servidor valida os dados antes de atualizar o estado.
+    this.onMessage(
+      "ball-move",
+      (client: Client, data: Partial<BallMoveData>) => {
+        this.handleBallMove(client, data);
       }
     );
 
@@ -310,7 +345,6 @@ class MatchRoom extends Room {
       FIELD_HALF_LENGTH - PLAYER_RADIUS
     );
 
-    // Mantém a colisão rígida do jogador com a bola.
     const ballBlocked = this.resolvePlayerBallMovement(
       player,
       oldX,
@@ -324,7 +358,6 @@ class MatchRoom extends Room {
       nextZ = ballBlocked.z;
     }
 
-    // Mantém a colisão rígida entre os dois jogadores.
     const playerBlocked = this.resolvePlayerPlayerMovement(
       client.sessionId,
       oldX,
@@ -362,14 +395,213 @@ class MatchRoom extends Room {
 
     player.lastMoveAt = now;
 
-    // O contato durante a corrida gera impulso no servidor.
-    // O mesmo cooldown também é usado pela mensagem ball-contact,
-    // evitando que os dois caminhos apliquem vários impulsos seguidos.
     if (ballBlocked) {
       this.applyPlayerBallImpulse(client.sessionId, player);
     }
 
     this.broadcast("players", this.players);
+  }
+
+  private handleBallMove(
+    client: Client,
+    data: Partial<BallMoveData>
+  ) {
+    const sessionId = client.sessionId;
+
+    if (!this.players[sessionId] || !data || typeof data !== "object") {
+      return;
+    }
+
+    if (this.goalResetTimer > 0) return;
+
+    const now = Date.now();
+    const lastPacketAt = this.lastBallMoveAt[sessionId] || 0;
+
+    // Limita a frequência para evitar sobrecarga.
+    if (now - lastPacketAt < BALL_MOVE_MIN_INTERVAL_MS) return;
+
+    const sequence = Math.max(
+      0,
+      Math.floor(finite(data.sequence, 0))
+    );
+
+    const previousSequence = this.lastBallMoveSequence[sessionId] || 0;
+
+    if (sequence > 0 && sequence <= previousSequence) return;
+
+    if (sequence > 0) {
+      this.lastBallMoveSequence[sessionId] = sequence;
+    }
+
+    this.lastBallMoveAt[sessionId] = now;
+
+    const b = this.ball;
+    const player = this.players[sessionId];
+
+    const requestedX = clamp(
+      finite(data.x, b.x),
+      -FIELD_HALF_WIDTH - 2,
+      FIELD_HALF_WIDTH + 2
+    );
+
+    const requestedY = clamp(
+      finite(data.y, b.y),
+      BALL_RADIUS,
+      GOAL_HEIGHT + 3
+    );
+
+    const requestedZ = clamp(
+      finite(data.z, b.z),
+      -FIELD_HALF_LENGTH - 3,
+      FIELD_HALF_LENGTH + 3
+    );
+
+    const requestedVX = clamp(
+      finite(data.vx, b.vx),
+      -MAX_BALL_SPEED,
+      MAX_BALL_SPEED
+    );
+
+    const requestedVY = clamp(
+      finite(data.vy, b.vy),
+      -MAX_BALL_SPEED,
+      MAX_BALL_SPEED
+    );
+
+    const requestedVZ = clamp(
+      finite(data.vz, b.vz),
+      -MAX_BALL_SPEED,
+      MAX_BALL_SPEED
+    );
+
+    // O cliente só pode corrigir a bola se a posição transmitida estiver
+    // razoavelmente próxima do estado oficial. Isso evita que um pacote
+    // atrasado teletransporte a bola para trás depois de um chute.
+    const positionError = Math.hypot(
+      requestedX - b.x,
+      requestedY - b.y,
+      requestedZ - b.z
+    );
+
+    const velocityError = Math.hypot(
+      requestedVX - b.vx,
+      requestedVY - b.vy,
+      requestedVZ - b.vz
+    );
+
+    // Se outro jogador acabou de chutar ou tocar na bola, os pacotes
+    // antigos do outro cliente não podem substituir a nova trajetória.
+    const hasFreshTrajectory =
+      Boolean(b.trajectoryOwner) &&
+      now <= b.trajectoryUntil &&
+      b.trajectoryOwner !== sessionId;
+
+    if (hasFreshTrajectory) {
+      client.send("trajectory-correction", {
+        reason: "newer-server-trajectory",
+        ...b
+      });
+      return;
+    }
+
+    // O servidor continua sendo a autoridade da bola.
+    // Aceita pequenas diferenças de previsão para reduzir o atraso visual,
+    // mas nunca permite grandes saltos de posição ou velocidade.
+    if (
+      positionError > BALL_MOVE_MAX_POSITION_ERROR ||
+      velocityError > BALL_MOVE_MAX_VELOCITY_ERROR
+    ) {
+      client.send("trajectory-correction", {
+        reason: "ball-state-too-far",
+        ...b
+      });
+      return;
+    }
+
+    const horizontalDistance = distance2D(
+      player.x,
+      player.y,
+      requestedX,
+      requestedZ
+    );
+
+    const nearBall =
+      horizontalDistance <=
+      PLAYER_BALL_DISTANCE + KICK_DISTANCE_ALLOWANCE + 0.7;
+
+    // Para o jogador que acabou de interagir com a bola, aceitamos uma
+    // reconciliação limitada. Se não está perto, não pode mover a bola
+    // livremente só enviando coordenadas.
+    const ownsRecentTrajectory =
+      b.trajectoryOwner === sessionId &&
+      now <= b.trajectoryUntil;
+
+    const ballIsNearlyStill =
+      Math.hypot(b.vx, b.vy, b.vz) < BALL_MOVE_IDLE_VELOCITY;
+
+    if (!nearBall && !ownsRecentTrajectory && !ballIsNearlyStill) {
+      client.send("trajectory-correction", {
+        reason: "player-too-far",
+        ...b
+      });
+      return;
+    }
+
+    // Limita o quanto a posição pode ser corrigida em um único pacote.
+    // A velocidade e a simulação do servidor continuam determinando
+    // a trajetória compartilhada.
+    const dx = requestedX - b.x;
+    const dy = requestedY - b.y;
+    const dz = requestedZ - b.z;
+    const distance = Math.hypot(dx, dy, dz);
+
+    const maxCorrection = Math.min(
+      BALL_MOVE_MAX_DISTANCE_PER_PACKET,
+      Math.max(0.12, MAX_BALL_SPEED * ((now - lastPacketAt) / 1000))
+    );
+
+    if (distance > 0.0001) {
+      const allowed = Math.min(distance, maxCorrection);
+      const factor = allowed / distance;
+
+      b.x += dx * factor;
+      b.y += dy * factor;
+      b.z += dz * factor;
+    }
+
+    // Não deixa o cliente apagar um chute confirmado. Quando a bola está
+    // em movimento, usa a velocidade oficial e suaviza apenas pequenas
+    // diferenças enviadas pela previsão local.
+    const authoritativeSpeed = Math.hypot(b.vx, b.vy, b.vz);
+
+    if (!ownsRecentTrajectory || authoritativeSpeed < 1.5) {
+      b.vx = b.vx * 0.75 + requestedVX * 0.25;
+      b.vy = b.vy * 0.75 + requestedVY * 0.25;
+      b.vz = b.vz * 0.75 + requestedVZ * 0.25;
+    }
+
+    if (typeof data.rx === "number" && Number.isFinite(data.rx)) {
+      b.rx = data.rx;
+    }
+
+    if (typeof data.rz === "number" && Number.isFinite(data.rz)) {
+      b.rz = data.rz;
+    }
+
+    this.clampBallVelocity();
+
+    // Se o cliente está próximo e a bola se moveu de forma válida,
+    // registra quem teve o contato mais recente.
+    if (nearBall && horizontalDistance <= PLAYER_BALL_DISTANCE + 0.55) {
+      b.lastTouch = sessionId;
+      this.lastBallMoveOwner = sessionId;
+    }
+
+    b.revision++;
+
+    // Retransmite imediatamente para os dois jogadores, sem esperar
+    // o próximo intervalo normal de broadcast.
+    this.broadcastBall();
   }
 
   private resolvePlayerBallMovement(
@@ -600,8 +832,6 @@ class MatchRoom extends Room {
 
     const speed = 11 + power * 19;
 
-    // O servidor aplica o chute uma única vez.
-    // Não existe mais disputa aleatória de trajetória entre clientes.
     this.lastKickAt[client.sessionId] = now;
 
     this.ball.vx += nx * speed;
@@ -809,12 +1039,6 @@ class MatchRoom extends Room {
       this.lastTrajectorySequence[client.sessionId] = sequence;
     }
 
-    // CORREÇÃO PRINCIPAL:
-    // Não aplicar x/y/z/vx/vy/vz enviados pelo cliente no estado real.
-    // Isso impedia a bola de voltar para uma posição antiga quando
-    // uma previsão atrasada chegava depois da simulação do servidor.
-    //
-    // A bola continua sendo atualizada pelo simulate() e pelo servidor.
     client.send("trajectory-correction", {
       reason: "server-authoritative",
       ...this.ball
@@ -934,6 +1158,7 @@ class MatchRoom extends Room {
           revision: previous.revision + 1
         };
 
+        this.lastBallMoveOwner = "";
         this.broadcastBall();
       }
 
@@ -1193,6 +1418,7 @@ class MatchRoom extends Room {
     this.ball.trajectoryUntil = 0;
     this.ball.revision++;
 
+    this.lastBallMoveOwner = "";
     this.goalResetTimer = GOAL_RESET_SECONDS;
 
     const result = {
@@ -1216,6 +1442,9 @@ class MatchRoom extends Room {
     this.lastContactAt = {};
     this.lastContactSequence = {};
     this.lastTrajectorySequence = {};
+    this.lastBallMoveAt = {};
+    this.lastBallMoveSequence = {};
+    this.lastBallMoveOwner = "";
 
     this.broadcast("score-state", {
       score: 0,
@@ -1229,7 +1458,6 @@ class MatchRoom extends Room {
   }
 
   private broadcastBall() {
-    // Cada mensagem contém uma cópia do estado oficial.
     this.broadcast("ball-state", { ...this.ball });
   }
 
@@ -1265,12 +1493,18 @@ class MatchRoom extends Room {
     delete this.lastContactAt[client.sessionId];
     delete this.lastContactSequence[client.sessionId];
     delete this.lastTrajectorySequence[client.sessionId];
+    delete this.lastBallMoveAt[client.sessionId];
+    delete this.lastBallMoveSequence[client.sessionId];
 
     if (this.ball.trajectoryOwner === client.sessionId) {
       this.ball.trajectoryOwner = "";
       this.ball.trajectoryUntil = 0;
       this.ball.revision++;
       this.broadcastBall();
+    }
+
+    if (this.lastBallMoveOwner === client.sessionId) {
+      this.lastBallMoveOwner = "";
     }
 
     this.broadcast("players", this.players);
