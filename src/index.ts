@@ -1,5 +1,5 @@
 
-import { Server, Room, Client } from "colyseus";
+import { Server, Room, Client, matchMaker } from "colyseus";
 import { WebSocketTransport } from "@colyseus/ws-transport";
 import express from "express";
 import http from "http";
@@ -45,7 +45,7 @@ gameServer.define("match", MatchRoom);
 
 app.post("/api/rooms/create", async (_req, res) => {
   try {
-    const room = await gameServer.createRoom("match", {});
+    const room = await matchMaker.createRoom("match", {});
     res.json({
       status: "ok",
       roomId: room.roomId,
