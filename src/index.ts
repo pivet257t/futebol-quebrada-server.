@@ -25,6 +25,10 @@ type BallState = {
   vz: number;
   rx: number;
   rz: number;
+  score: number;
+  goalsA: number;
+  goalsB: number;
+  lastGoal: string;
 };
 
 const app = express();
@@ -51,16 +55,61 @@ app.get("/", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
-    game: "Futebol de Quebrada"
+    game: "Futebol de Quebrada",
+    authority: "server",
+    multiplayer: true
   });
 });
+
+const FIELD_HALF_WIDTH = 18;
+const FIELD_HALF_LENGTH = 30;
+const GOAL_HALF_WIDTH = 4.25;
+const GOAL_HEIGHT = 3.2;
+
+const BALL_RADIUS = 0.25;
+const GRAVITY = 18;
+const BOUNCE = 0.68;
+const ROLLING_FRICTION = 0.985;
+const AIR_DRAG = 0.999;
+const MAX_SPEED = 35;
+const BALL_UPDATE_MS = 50;
+const GOAL_RESET_SECONDS = 1.5;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function finite(value: unknown, fallback = 0) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : fallback;
+}
+
+function createInitialBall(): BallState {
+  return {
+    x: 0,
+    y: BALL_RADIUS,
+    z: 0,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    rx: 0,
+    rz: 0,
+    score: 0,
+    goalsA: 0,
+    goalsB: 0,
+    lastGoal: ""
+  };
+}
 
 class MatchRoom extends Room {
   maxClients = 2;
 
   players: Record<string, PlayerData> = {};
-  hostSessionId: string | null = null;
-  lastBallState: BallState | null = null;
+  ball: BallState = createInitialBall();
+
+  private goalResetTimer = 0;
+  private lastKickAt: Record<string, number> = {};
 
   onCreate() {
     this.setMetadata({
@@ -68,75 +117,275 @@ class MatchRoom extends Room {
       createdAt: Date.now()
     });
 
-    this.onMessage("move", (client: Client, data: Partial<PlayerData>) => {
-      const player = this.players[client.sessionId];
-      if (!player || !data || typeof data !== "object") return;
+    // Movimento dos jogadores.
+    // O servidor recebe e retransmite as posições.
+    this.onMessage(
+      "move",
+      (client: Client, data: Partial<PlayerData>) => {
+        const player = this.players[client.sessionId];
 
-      if (typeof data.x === "number" && Number.isFinite(data.x)) {
-        player.x = Math.max(-1000, Math.min(1000, data.x));
+        if (!player || !data || typeof data !== "object") {
+          return;
+        }
+
+        if (typeof data.x === "number" && Number.isFinite(data.x)) {
+          player.x = clamp(data.x, -1000, 1000);
+        }
+
+        if (typeof data.y === "number" && Number.isFinite(data.y)) {
+          player.y = clamp(data.y, -1000, 1000);
+        }
+
+        if (
+          typeof data.rotation === "number" &&
+          Number.isFinite(data.rotation)
+        ) {
+          player.rotation = data.rotation;
+        }
+
+        this.broadcast("players", this.players);
       }
+    );
 
-      if (typeof data.y === "number" && Number.isFinite(data.y)) {
-        player.y = Math.max(-1000, Math.min(1000, data.y));
+    // Os DOIS jogadores podem pedir um chute.
+    // O servidor aplica a força à bola; nenhum jogador
+    // é responsável por simular ou transmitir sua física.
+    this.onMessage(
+      "kick",
+      (client: Client, data: Partial<KickData>) => {
+        if (!this.players[client.sessionId]) return;
+        if (!data || typeof data !== "object") return;
+        if (this.goalResetTimer > 0) return;
+
+        const now = Date.now();
+        const last = this.lastKickAt[client.sessionId] || 0;
+
+        if (now - last < 180) return;
+        this.lastKickAt[client.sessionId] = now;
+
+        const player = this.players[client.sessionId];
+
+        const dx = finite(data.dx);
+        const dy = finite(data.dy);
+        const dz = finite(data.dz, -1);
+        const power = clamp(finite(data.power, 0.5), 0.22, 1);
+
+        // Confere se o jogador está perto da bola.
+        const distance = Math.sqrt(
+          Math.pow(player.x - this.ball.x, 2) +
+          Math.pow(player.y - this.ball.z, 2)
+        );
+
+        if (distance > 5.5) return;
+
+        // Direção normalizada.
+        let length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (length < 0.001) {
+          return;
+        }
+
+        const nx = dx / length;
+        const ny = dy / length;
+        const nz = dz / length;
+
+        // Velocidade calculada pelo servidor.
+        const speed = 11 + power * 19;
+
+        this.ball.vx = clamp(nx * speed, -MAX_SPEED, MAX_SPEED);
+        this.ball.vy = clamp(
+          Math.max(1.5, ny * speed + 2.5),
+          -MAX_SPEED,
+          MAX_SPEED
+        );
+        this.ball.vz = clamp(nz * speed, -MAX_SPEED, MAX_SPEED);
+
+        this.ball.lastGoal = "";
+
+        // A confirmação vai para todos, inclusive quem chutou.
+        this.broadcast("kick-confirmed", {
+          sessionId: client.sessionId,
+          power
+        });
+
+        this.broadcastBall();
       }
+    );
 
-      if (
-        typeof data.rotation === "number" &&
-        Number.isFinite(data.rotation)
-      ) {
-        player.rotation = data.rotation;
-      }
-
-      this.broadcast("players", this.players);
-    });
-
-    this.onMessage("kick", (client: Client, data: Partial<KickData>) => {
+    // Reinício solicitado por qualquer jogador.
+    this.onMessage("reset-match", (client: Client) => {
       if (!this.players[client.sessionId]) return;
-      if (!data || typeof data !== "object") return;
 
-      const dx = Number(data.dx);
-      const dy = Number(data.dy);
-      const dz = Number(data.dz);
-      const power = Number(data.power);
+      this.ball = createInitialBall();
+      this.goalResetTimer = 0;
 
-      const kick: KickData = {
-        dx: Number.isFinite(dx) ? Math.max(-1, Math.min(1, dx)) : 0,
-        dy: Number.isFinite(dy) ? Math.max(-1, Math.min(1, dy)) : 0,
-        dz: Number.isFinite(dz) ? Math.max(-1, Math.min(1, dz)) : -1,
-        power: Number.isFinite(power)
-          ? Math.max(0.22, Math.min(1, power))
-          : 0.5
-      };
+      this.broadcast("score-state", {
+        score: 0,
+        goalsA: 0,
+        goalsB: 0,
+        matchOver: false,
+        lastGoal: ""
+      });
 
-      this.broadcast("kick", kick, { except: client });
+      this.broadcastBall();
     });
 
-    this.onMessage("ball-state", (client: Client, data: Partial<BallState>) => {
-      if (client.sessionId !== this.hostSessionId) return;
-      if (!data || typeof data !== "object") return;
+    // Compatibilidade com clientes antigos:
+    // não aceitamos ball-state enviado pelos jogadores.
+    // A posição da bola só pode ser calculada pelo servidor.
 
-      const keys: (keyof BallState)[] = [
-        "x", "y", "z", "vx", "vy", "vz", "rx", "rz"
-      ];
+    this.setSimulationInterval((deltaTime) => {
+      this.simulateBall(deltaTime / 1000);
+    }, BALL_UPDATE_MS);
+  }
 
-      const ball = {} as BallState;
+  private simulateBall(dt: number) {
+    if (!Number.isFinite(dt) || dt <= 0) return;
 
-      for (const key of keys) {
-        const value = data[key];
-        if (typeof value !== "number" || !Number.isFinite(value)) return;
-        ball[key] = Math.max(-10000, Math.min(10000, value));
+    // Limita saltos grandes após atrasos do servidor.
+    dt = Math.min(dt, 0.05);
+
+    if (this.goalResetTimer > 0) {
+      this.goalResetTimer -= dt;
+
+      if (this.goalResetTimer <= 0) {
+        this.ball.x = 0;
+        this.ball.y = BALL_RADIUS;
+        this.ball.z = 0;
+        this.ball.vx = 0;
+        this.ball.vy = 0;
+        this.ball.vz = 0;
+        this.ball.rx = 0;
+        this.ball.rz = 0;
+        this.broadcastBall();
       }
 
-      this.lastBallState = ball;
-      this.broadcast("ball-state", ball, { except: client });
-    });
+      return;
+    }
+
+    const b = this.ball;
+
+    // Gravidade.
+    b.vy -= GRAVITY * dt;
+
+    // Integração da física no servidor.
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.z += b.vz * dt;
+
+    // Rotação visual aproximada da bola.
+    b.rx += b.vz * dt * 1.8;
+    b.rz -= b.vx * dt * 1.8;
+
+    // Atrito no ar.
+    b.vx *= Math.pow(AIR_DRAG, dt * 60);
+    b.vy *= Math.pow(AIR_DRAG, dt * 60);
+    b.vz *= Math.pow(AIR_DRAG, dt * 60);
+
+    // Colisão com o chão.
+    if (b.y < BALL_RADIUS) {
+      b.y = BALL_RADIUS;
+
+      if (b.vy < -1.1) {
+        b.vy = -b.vy * BOUNCE;
+      } else {
+        b.vy = 0;
+      }
+
+      b.vx *= Math.pow(ROLLING_FRICTION, dt * 60);
+      b.vz *= Math.pow(ROLLING_FRICTION, dt * 60);
+    }
+
+    // Limites laterais do campo.
+    if (b.x < -FIELD_HALF_WIDTH + BALL_RADIUS) {
+      b.x = -FIELD_HALF_WIDTH + BALL_RADIUS;
+      b.vx = Math.abs(b.vx) * 0.72;
+    }
+
+    if (b.x > FIELD_HALF_WIDTH - BALL_RADIUS) {
+      b.x = FIELD_HALF_WIDTH - BALL_RADIUS;
+      b.vx = -Math.abs(b.vx) * 0.72;
+    }
+
+    // Gols nas duas extremidades do campo.
+    const insideGoalWidth = Math.abs(b.x) <= GOAL_HALF_WIDTH;
+    const lowEnough = b.y <= GOAL_HEIGHT;
+
+    if (
+      insideGoalWidth &&
+      lowEnough &&
+      b.z < -FIELD_HALF_LENGTH
+    ) {
+      this.registerGoal("A");
+      return;
+    }
+
+    if (
+      insideGoalWidth &&
+      lowEnough &&
+      b.z > FIELD_HALF_LENGTH
+    ) {
+      this.registerGoal("B");
+      return;
+    }
+
+    // Se não entrou no gol, rebate no fundo.
+    if (b.z < -FIELD_HALF_LENGTH) {
+      b.z = -FIELD_HALF_LENGTH;
+      b.vz = Math.abs(b.vz) * 0.72;
+    }
+
+    if (b.z > FIELD_HALF_LENGTH) {
+      b.z = FIELD_HALF_LENGTH;
+      b.vz = -Math.abs(b.vz) * 0.72;
+    }
+
+    // Evita velocidades absurdas.
+    b.vx = clamp(b.vx, -MAX_SPEED, MAX_SPEED);
+    b.vy = clamp(b.vy, -MAX_SPEED, MAX_SPEED);
+    b.vz = clamp(b.vz, -MAX_SPEED, MAX_SPEED);
+
+    // Atualização contínua para os dois clientes.
+    this.broadcastBall();
+  }
+
+  private registerGoal(team: "A" | "B") {
+    if (team === "A") {
+      this.ball.goalsA += 1;
+    } else {
+      this.ball.goalsB += 1;
+    }
+
+    this.ball.score += 1;
+    this.ball.lastGoal = team;
+
+    this.ball.x = 0;
+    this.ball.y = BALL_RADIUS;
+    this.ball.z = 0;
+    this.ball.vx = 0;
+    this.ball.vy = 0;
+    this.ball.vz = 0;
+
+    this.goalResetTimer = GOAL_RESET_SECONDS;
+
+    const result = {
+      score: this.ball.score,
+      goalsA: this.ball.goalsA,
+      goalsB: this.ball.goalsB,
+      lastGoal: team,
+      matchOver: false
+    };
+
+    this.broadcast("goal", result);
+    this.broadcast("score-state", result);
+    this.broadcastBall();
+  }
+
+  private broadcastBall() {
+    this.broadcast("ball-state", { ...this.ball });
   }
 
   onJoin(client: Client) {
-    if (!this.hostSessionId) {
-      this.hostSessionId = client.sessionId;
-    }
-
     this.players[client.sessionId] = {
       x: 0,
       y: 0,
@@ -146,19 +395,23 @@ class MatchRoom extends Room {
     client.send("players", this.players);
     this.broadcast("players", this.players);
 
-    if (this.lastBallState) {
-      client.send("ball-state", this.lastBallState);
-    }
+    // O jogador novo recebe a bola e o placar atuais.
+    client.send("ball-state", { ...this.ball });
+
+    client.send("score-state", {
+      score: this.ball.score,
+      goalsA: this.ball.goalsA,
+      goalsB: this.ball.goalsB,
+      lastGoal: this.ball.lastGoal,
+      matchOver: false
+    });
 
     console.log("Jogador entrou:", client.sessionId);
   }
 
   onLeave(client: Client) {
     delete this.players[client.sessionId];
-
-    if (this.hostSessionId === client.sessionId) {
-      this.hostSessionId = Object.keys(this.players)[0] || null;
-    }
+    delete this.lastKickAt[client.sessionId];
 
     this.broadcast("players", this.players);
 
@@ -248,7 +501,12 @@ app.post("/api/rooms/join", (req, res) => {
   });
 });
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((
+  err: unknown,
+  _req: express.Request,
+  res: express.Response,
+  _next: express.NextFunction
+) => {
   console.error("Erro HTTP:", err);
 
   if (!res.headersSent) {
