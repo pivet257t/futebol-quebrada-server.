@@ -95,12 +95,40 @@ const gameServer = new Server({
 
 gameServer.define("match", MatchRoom);
 
+const roomCodes = new Map<string, string>();
+
 app.post("/api/rooms/create", async (_req, res) => {
   try {
-    const room = await matchMaker.createRoom("match", {});
+    let code = "";
+
+    for (let i = 0; i < 50; i++) {
+      const candidate = String(
+        Math.floor(100000 + Math.random() * 900000)
+      );
+
+      if (!roomCodes.has(candidate)) {
+        code = candidate;
+        break;
+      }
+    }
+
+    if (!code) {
+      res.status(503).json({
+        status: "error",
+        message: "Tente criar a sala novamente"
+      });
+      return;
+    }
+
+    const room = await matchMaker.createRoom("match", {
+      code
+    });
+
+    roomCodes.set(code, room.roomId);
 
     res.json({
       status: "ok",
+      code,
       roomId: room.roomId,
       message: "Sala criada"
     });
@@ -112,6 +140,33 @@ app.post("/api/rooms/create", async (_req, res) => {
       message: "Não foi possível criar a sala"
     });
   }
+});
+
+app.post("/api/rooms/join", (req, res) => {
+  const code = String(req.body?.code || "").trim();
+
+  if (!/^\d{6}$/.test(code)) {
+    res.status(400).json({
+      status: "error",
+      message: "Digite um código de 6 números"
+    });
+    return;
+  }
+
+  const roomId = roomCodes.get(code);
+
+  if (!roomId) {
+    res.status(404).json({
+      status: "error",
+      message: "Sala não encontrada ou servidor reiniciado"
+    });
+    return;
+  }
+
+  res.json({
+    status: "ok",
+    roomId
+  });
 });
 
 const port = Number(process.env.PORT || 2567);
