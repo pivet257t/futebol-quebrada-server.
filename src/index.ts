@@ -1,4 +1,3 @@
-
 import { Server, Room, Client, matchMaker } from "colyseus";
 import { WebSocketTransport } from "@colyseus/ws-transport";
 import express from "express";
@@ -19,7 +18,6 @@ app.use((req, res, next) => {
 
   next();
 });
-
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -44,6 +42,7 @@ class MatchRoom extends Room {
       createdAt: Date.now()
     });
 
+    // Sincronizar movimento dos jogadores
     this.onMessage("move", (client, data) => {
       const player = this.state.players[client.sessionId];
       if (!player || !data) return;
@@ -61,6 +60,25 @@ class MatchRoom extends Room {
       }
 
       this.broadcast("players", this.state.players);
+    });
+
+    // Sincronizar chutes
+    this.onMessage("kick", (client, data) => {
+      if (!data) return;
+
+      this.broadcast("kick", {
+        dx: Number(data.dx) || 0,
+        dy: Number(data.dy) || 0,
+        dz: Number(data.dz) || -1,
+        power: Number(data.power) || 0.5
+      });
+    });
+
+    // Sincronizar estado da bola
+    this.onMessage("ball-state", (client, data) => {
+      if (!data) return;
+
+      this.broadcast("ball-state", data);
     });
   }
 
@@ -81,6 +99,7 @@ class MatchRoom extends Room {
     delete this.state.players[client.sessionId];
 
     this.broadcast("players", this.state.players);
+
     console.log("Jogador saiu:", client.sessionId);
   }
 }
@@ -97,6 +116,7 @@ gameServer.define("match", MatchRoom);
 
 const roomCodes = new Map<string, string>();
 
+// Criar sala com código numérico de 6 dígitos
 app.post("/api/rooms/create", async (_req, res) => {
   try {
     let code = "";
@@ -142,6 +162,7 @@ app.post("/api/rooms/create", async (_req, res) => {
   }
 });
 
+// Entrar usando o código numérico
 app.post("/api/rooms/join", (req, res) => {
   const code = String(req.body?.code || "").trim();
 
