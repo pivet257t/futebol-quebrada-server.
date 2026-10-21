@@ -3,20 +3,49 @@ import { WebSocketTransport } from "@colyseus/ws-transport";
 import express from "express";
 import http from "http";
 
-const app = express();
-app.use(express.json());
+type PlayerData = {
+  x: number;
+  y: number;
+  rotation: number;
+};
 
-app.use((req, res, next) => {
+type KickData = {
+  dx: number;
+  dy: number;
+  dz: number;
+  power: number;
+};
+
+type BallState = {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  rx: number;
+  rz: number;
+};
+
+const app = express();
+app.disable("x-powered-by");
+app.use(express.json({ limit: "10kb" }));
+
+app.use((_req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
+  if (_req.method === "OPTIONS") {
     res.sendStatus(204);
     return;
   }
 
   next();
+});
+
+app.get("/", (_req, res) => {
+  res.status(200).send("Futebol de Quebrada — servidor online.");
 });
 
 app.get("/health", (_req, res) => {
@@ -29,76 +58,109 @@ app.get("/health", (_req, res) => {
 class MatchRoom extends Room {
   maxClients = 2;
 
-  state = {
-    players: {} as Record<string, {
-      x: number;
-      y: number;
-      rotation: number;
-    }>
-  };
+  players: Record<string, PlayerData> = {};
+  hostSessionId: string | null = null;
+  lastBallState: BallState | null = null;
 
   onCreate() {
     this.setMetadata({
+      game: "Futebol de Quebrada",
       createdAt: Date.now()
     });
 
-    // Sincronizar movimento dos jogadores
-    this.onMessage("move", (client, data) => {
-      const player = this.state.players[client.sessionId];
-      if (!player || !data) return;
+    this.onMessage("move", (client: Client, data: Partial<PlayerData>) => {
+      const player = this.players[client.sessionId];
+      if (!player || !data || typeof data !== "object") return;
 
-      if (typeof data.x === "number") {
+      if (typeof data.x === "number" && Number.isFinite(data.x)) {
         player.x = Math.max(-1000, Math.min(1000, data.x));
       }
 
-      if (typeof data.y === "number") {
+      if (typeof data.y === "number" && Number.isFinite(data.y)) {
         player.y = Math.max(-1000, Math.min(1000, data.y));
       }
 
-      if (typeof data.rotation === "number") {
+      if (
+        typeof data.rotation === "number" &&
+        Number.isFinite(data.rotation)
+      ) {
         player.rotation = data.rotation;
       }
 
-      this.broadcast("players", this.state.players);
+      this.broadcast("players", this.players);
     });
 
-    // Sincronizar chutes
-    this.onMessage("kick", (client, data) => {
-      if (!data) return;
+    this.onMessage("kick", (client: Client, data: Partial<KickData>) => {
+      if (!this.players[client.sessionId]) return;
+      if (!data || typeof data !== "object") return;
 
-      this.broadcast("kick", {
-        dx: Number(data.dx) || 0,
-        dy: Number(data.dy) || 0,
-        dz: Number(data.dz) || -1,
-        power: Number(data.power) || 0.5
-      });
+      const dx = Number(data.dx);
+      const dy = Number(data.dy);
+      const dz = Number(data.dz);
+      const power = Number(data.power);
+
+      const kick: KickData = {
+        dx: Number.isFinite(dx) ? Math.max(-1, Math.min(1, dx)) : 0,
+        dy: Number.isFinite(dy) ? Math.max(-1, Math.min(1, dy)) : 0,
+        dz: Number.isFinite(dz) ? Math.max(-1, Math.min(1, dz)) : -1,
+        power: Number.isFinite(power)
+          ? Math.max(0.22, Math.min(1, power))
+          : 0.5
+      };
+
+      this.broadcast("kick", kick, { except: client });
     });
 
-    // Sincronizar estado da bola
-    this.onMessage("ball-state", (client, data) => {
-      if (!data) return;
+    this.onMessage("ball-state", (client: Client, data: Partial<BallState>) => {
+      if (client.sessionId !== this.hostSessionId) return;
+      if (!data || typeof data !== "object") return;
 
-      this.broadcast("ball-state", data);
+      const keys: (keyof BallState)[] = [
+        "x", "y", "z", "vx", "vy", "vz", "rx", "rz"
+      ];
+
+      const ball = {} as BallState;
+
+      for (const key of keys) {
+        const value = data[key];
+        if (typeof value !== "number" || !Number.isFinite(value)) return;
+        ball[key] = Math.max(-10000, Math.min(10000, value));
+      }
+
+      this.lastBallState = ball;
+      this.broadcast("ball-state", ball, { except: client });
     });
   }
 
   onJoin(client: Client) {
-    this.state.players[client.sessionId] = {
+    if (!this.hostSessionId) {
+      this.hostSessionId = client.sessionId;
+    }
+
+    this.players[client.sessionId] = {
       x: 0,
       y: 0,
       rotation: 0
     };
 
-    client.send("players", this.state.players);
-    this.broadcast("players", this.state.players);
+    client.send("players", this.players);
+    this.broadcast("players", this.players);
+
+    if (this.lastBallState) {
+      client.send("ball-state", this.lastBallState);
+    }
 
     console.log("Jogador entrou:", client.sessionId);
   }
 
   onLeave(client: Client) {
-    delete this.state.players[client.sessionId];
+    delete this.players[client.sessionId];
 
-    this.broadcast("players", this.state.players);
+    if (this.hostSessionId === client.sessionId) {
+      this.hostSessionId = Object.keys(this.players)[0] || null;
+    }
+
+    this.broadcast("players", this.players);
 
     console.log("Jogador saiu:", client.sessionId);
   }
@@ -116,60 +178,55 @@ gameServer.define("match", MatchRoom);
 
 const roomCodes = new Map<string, string>();
 
-// Criar sala com código numérico de 6 dígitos
+function createCode(): string {
+  for (let i = 0; i < 100; i++) {
+    const code = String(
+      Math.floor(100000 + Math.random() * 900000)
+    );
+
+    if (!roomCodes.has(code)) return code;
+  }
+
+  throw new Error("Não foi possível gerar um código de sala.");
+}
+
 app.post("/api/rooms/create", async (_req, res) => {
+  let code: string | undefined;
+
   try {
-    let code = "";
+    code = createCode();
 
-    for (let i = 0; i < 50; i++) {
-      const candidate = String(
-        Math.floor(100000 + Math.random() * 900000)
-      );
-
-      if (!roomCodes.has(candidate)) {
-        code = candidate;
-        break;
-      }
-    }
-
-    if (!code) {
-      res.status(503).json({
-        status: "error",
-        message: "Tente criar a sala novamente"
-      });
-      return;
-    }
-
-    const room = await matchMaker.createRoom("match", {
-      code
-    });
+    const room = await matchMaker.createRoom("match", { code });
 
     roomCodes.set(code, room.roomId);
 
-    res.json({
+    res.status(201).json({
       status: "ok",
       code,
       roomId: room.roomId,
       message: "Sala criada"
     });
   } catch (error) {
+    if (code) roomCodes.delete(code);
+
     console.error("Erro ao criar sala:", error);
 
-    res.status(500).json({
-      status: "error",
-      message: "Não foi possível criar a sala"
-    });
+    if (!res.headersSent) {
+      res.status(500).json({
+        status: "error",
+        message: "Não foi possível criar a sala. Tente novamente."
+      });
+    }
   }
 });
 
-// Entrar usando o código numérico
 app.post("/api/rooms/join", (req, res) => {
   const code = String(req.body?.code || "").trim();
 
   if (!/^\d{6}$/.test(code)) {
     res.status(400).json({
       status: "error",
-      message: "Digite um código de 6 números"
+      message: "Digite o código de 6 números."
     });
     return;
   }
@@ -179,19 +236,36 @@ app.post("/api/rooms/join", (req, res) => {
   if (!roomId) {
     res.status(404).json({
       status: "error",
-      message: "Sala não encontrada ou servidor reiniciado"
+      message: "Sala não encontrada. Confira o código ou crie outra sala."
     });
     return;
   }
 
   res.json({
     status: "ok",
+    code,
     roomId
   });
 });
 
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error("Erro HTTP:", err);
+
+  if (!res.headersSent) {
+    res.status(400).json({
+      status: "error",
+      message: "Não foi possível processar a solicitação."
+    });
+  }
+});
+
 const port = Number(process.env.PORT || 2567);
 
-gameServer.listen(port).then(() => {
-  console.log("Servidor iniciado na porta", port);
-});
+gameServer.listen(port)
+  .then(() => {
+    console.log("Servidor iniciado na porta", port);
+  })
+  .catch((error: unknown) => {
+    console.error("Falha ao iniciar o servidor:", error);
+    process.exitCode = 1;
+  });
