@@ -17,6 +17,8 @@ type KickData = {
   dy: number;
   dz: number;
   power: number;
+  clientTime?: number;
+  sequence?: number;
 };
 
 type BallState = {
@@ -32,6 +34,20 @@ type BallState = {
   goalsA: number;
   goalsB: number;
   lastGoal: string;
+  lastTouch: string;
+  revision: number;
+};
+
+type ContactData = {
+  sessionId: string;
+  sequence: number;
+  revision: number;
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
 };
 
 const app = express();
@@ -61,7 +77,9 @@ app.get("/health", (_req, res) => {
     game: "Futebol de Quebrada",
     authority: "server",
     multiplayer: true,
-    physics: "server-authoritative"
+    physics: "server-authoritative",
+    prediction: true,
+    sharedBall: true
   });
 });
 
@@ -84,10 +102,17 @@ const MAX_BALL_SPEED = 35;
 const MAX_PLAYER_SPEED = 6;
 const MAX_PLAYER_STEP = 0.18;
 const SIMULATION_MS = 1000 / 60;
-const BALL_BROADCAST_MS = 50;
+const BALL_BROADCAST_MS = 33;
 const GOAL_RESET_SECONDS = 1.5;
-const KICK_COOLDOWN_MS = 180;
-const PLAYER_BROADCAST_MS = 50;
+const KICK_COOLDOWN_MS = 120;
+const PLAYER_BROADCAST_MS = 33;
+
+const CONTACT_COOLDOWN_MS = 100;
+const MAX_CONTACT_IMPULSE = 5;
+const MIN_CONTACT_SPEED = 0.12;
+const KICK_DISTANCE_ALLOWANCE = 0.48;
+const CONTACT_DISTANCE_ALLOWANCE = 0.10;
+const MAX_KICK_POWER = 1;
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -112,7 +137,9 @@ function createInitialBall(): BallState {
     score: 0,
     goalsA: 0,
     goalsB: 0,
-    lastGoal: ""
+    lastGoal: "",
+    lastTouch: "",
+    revision: 0
   };
 }
 
@@ -133,6 +160,8 @@ class MatchRoom extends Room {
 
   private goalResetTimer = 0;
   private lastKickAt: Record<string, number> = {};
+  private lastContactAt: Record<string, number> = {};
+  private lastContactSequence: Record<string, number> = {};
   private simulationAccumulator = 0;
   private lastSimulationAt = 0;
   private lastBallBroadcastAt = 0;
@@ -158,6 +187,15 @@ class MatchRoom extends Room {
       }
     );
 
+    // O cliente pode prever o contato para dar resposta imediata.
+    // O servidor continua validando a posição e a velocidade reais.
+    this.onMessage(
+      "ball-contact",
+      (client: Client, data: Partial<KickData>) => {
+        this.handleBallContact(client, data);
+      }
+    );
+
     this.onMessage("reset-match", (client: Client) => {
       if (!this.players[client.sessionId]) return;
       this.resetMatch();
@@ -177,10 +215,7 @@ class MatchRoom extends Room {
         this.simulationAccumulator >= SIMULATION_MS / 1000 &&
         steps < 6
       ) {
-        this.simulate(
-          SIMULATION_MS / 1000
-        );
-
+        this.simulate(SIMULATION_MS / 1000);
         this.simulationAccumulator -= SIMULATION_MS / 1000;
         steps++;
       }
@@ -189,19 +224,17 @@ class MatchRoom extends Room {
         this.simulationAccumulator = 0;
       }
 
-      if (
-        now - this.lastBallBroadcastAt >= BALL_BROADCAST_MS
-      ) {
+      if (now - this.lastBallBroadcastAt >= BALL_BROADCAST_MS) {
         this.lastBallBroadcastAt = now;
         this.broadcastBall();
       }
 
-      if (
-        now - this.lastPlayersBroadcastAt >= PLAYER_BROADCAST_MS
-      ) {
+      if (now - this.lastPlayersBroadcastAt >= PLAYER_BROADCAST_MS) {
         this.lastPlayersBroadcastAt = now;
         this.broadcast("players", this.players);
       }
+
+      this.lastSimulationAt = now;
     }, SIMULATION_MS);
   }
 
@@ -211,9 +244,7 @@ class MatchRoom extends Room {
   ) {
     const player = this.players[client.sessionId];
 
-    if (!player || !data || typeof data !== "object") {
-      return;
-    }
+    if (!player || !data || typeof data !== "object") return;
 
     const now = Date.now();
 
@@ -229,12 +260,10 @@ class MatchRoom extends Room {
     const requestedX = finite(data.x, oldX);
     const requestedZ = finite(data.y, oldZ);
 
-    // Limita a distância que o cliente pode solicitar
-    // em uma atualização. A posição final é decidida
-    // exclusivamente pelo servidor.
     const dx = requestedX - oldX;
     const dz = requestedZ - oldZ;
     const requestedDistance = Math.hypot(dx, dz);
+
     const maxDistance = Math.min(
       MAX_PLAYER_STEP,
       MAX_PLAYER_SPEED * elapsed
@@ -265,8 +294,6 @@ class MatchRoom extends Room {
       FIELD_HALF_LENGTH - PLAYER_RADIUS
     );
 
-    // Impede o jogador de atravessar a bola durante
-    // o deslocamento, verificando o caminho percorrido.
     const ballBlocked = this.resolvePlayerBallMovement(
       player,
       oldX,
@@ -280,7 +307,6 @@ class MatchRoom extends Room {
       nextZ = ballBlocked.z;
     }
 
-    // Impede jogadores de ocuparem o mesmo espaço.
     const playerBlocked = this.resolvePlayerPlayerMovement(
       client.sessionId,
       oldX,
@@ -318,10 +344,8 @@ class MatchRoom extends Room {
 
     player.lastMoveAt = now;
 
-    // Impulso por contato corporal: somente quando
-    // o jogador realmente se aproxima da bola.
     if (ballBlocked) {
-      this.applyPlayerBallImpulse(player);
+      this.applyPlayerBallImpulse(client.sessionId, player);
     }
 
     this.broadcast("players", this.players);
@@ -336,13 +360,8 @@ class MatchRoom extends Room {
   ): { x: number; z: number } | null {
     const b = this.ball;
 
-    if (b.y - BALL_RADIUS > PLAYER_HEIGHT) {
-      return null;
-    }
-
-    if (b.y + BALL_RADIUS < 0) {
-      return null;
-    }
+    if (b.y - BALL_RADIUS > PLAYER_HEIGHT) return null;
+    if (b.y + BALL_RADIUS < 0) return null;
 
     const dx = nextX - oldX;
     const dz = nextZ - oldZ;
@@ -369,9 +388,7 @@ class MatchRoom extends Room {
       b.z
     );
 
-    if (distance >= PLAYER_BALL_DISTANCE) {
-      return null;
-    }
+    if (distance >= PLAYER_BALL_DISTANCE) return null;
 
     let nx = closestX - b.x;
     let nz = closestZ - b.z;
@@ -392,7 +409,6 @@ class MatchRoom extends Room {
     nx /= normalLength;
     nz /= normalLength;
 
-    // A posição final precisa respeitar a esfera da bola.
     let correctedX = nextX;
     let correctedZ = nextZ;
 
@@ -481,14 +497,19 @@ class MatchRoom extends Room {
     return collided ? { x, z } : null;
   }
 
-  private applyPlayerBallImpulse(player: PlayerData) {
+  private applyPlayerBallImpulse(
+    sessionId: string,
+    player: PlayerData
+  ) {
     const b = this.ball;
 
     let dx = b.x - player.x;
     let dz = b.z - player.y;
     let distance = Math.hypot(dx, dz);
 
-    if (distance > PLAYER_BALL_DISTANCE + 0.08) return;
+    if (distance > PLAYER_BALL_DISTANCE + CONTACT_DISTANCE_ALLOWANCE) {
+      return;
+    }
 
     if (distance < 0.0001) {
       dx = 1;
@@ -499,18 +520,188 @@ class MatchRoom extends Room {
     const nx = dx / distance;
     const nz = dz / distance;
 
-    const speedTowardBall =
-      player.vx * nx + player.vz * nz;
+    const speedTowardBall = player.vx * nx + player.vz * nz;
 
-    if (speedTowardBall <= 0) return;
+    if (speedTowardBall <= MIN_CONTACT_SPEED) return;
 
-    const impulse = Math.min(speedTowardBall * 0.75, 4);
+    const now = Date.now();
+    const last = this.lastContactAt[sessionId] || 0;
+
+    if (now - last < CONTACT_COOLDOWN_MS) return;
+
+    this.lastContactAt[sessionId] = now;
+
+    const impulse = Math.min(
+      speedTowardBall * 0.75,
+      MAX_CONTACT_IMPULSE
+    );
 
     b.vx += nx * impulse;
     b.vz += nz * impulse;
 
     b.vx = clamp(b.vx, -MAX_BALL_SPEED, MAX_BALL_SPEED);
     b.vz = clamp(b.vz, -MAX_BALL_SPEED, MAX_BALL_SPEED);
+
+    b.lastTouch = sessionId;
+    b.revision++;
+
+    this.broadcast("ball-contact-confirmed", {
+      sessionId,
+      revision: b.revision,
+      x: b.x,
+      y: b.y,
+      z: b.z,
+      vx: b.vx,
+      vy: b.vy,
+      vz: b.vz
+    });
+
+    this.broadcastBall();
+  }
+
+  private handleBallContact(
+    client: Client,
+    data: Partial<KickData>
+  ) {
+    const player = this.players[client.sessionId];
+
+    if (!player || !data || typeof data !== "object") return;
+    if (this.goalResetTimer > 0) return;
+
+    const now = Date.now();
+    const sequence = Math.max(
+      0,
+      Math.floor(finite(data.sequence, 0))
+    );
+
+    const lastSequence = this.lastContactSequence[client.sessionId] || 0;
+
+    if (sequence > 0 && sequence <= lastSequence) return;
+
+    if (sequence > 0) {
+      this.lastContactSequence[client.sessionId] = sequence;
+    }
+
+    const distance = distance2D(
+      player.x,
+      player.y,
+      this.ball.x,
+      this.ball.z
+    );
+
+    if (
+      distance >
+      PLAYER_BALL_DISTANCE + CONTACT_DISTANCE_ALLOWANCE
+    ) {
+      client.send("ball-contact-rejected", {
+        sequence,
+        revision: this.ball.revision,
+        reason: "too-far"
+      });
+      return;
+    }
+
+    if (
+      this.ball.y - BALL_RADIUS > PLAYER_HEIGHT ||
+      this.ball.y + BALL_RADIUS < 0
+    ) {
+      client.send("ball-contact-rejected", {
+        sequence,
+        revision: this.ball.revision,
+        reason: "height"
+      });
+      return;
+    }
+
+    const last = this.lastContactAt[client.sessionId] || 0;
+
+    if (now - last < CONTACT_COOLDOWN_MS) {
+      client.send("ball-contact-rejected", {
+        sequence,
+        revision: this.ball.revision,
+        reason: "cooldown"
+      });
+      return;
+    }
+
+    let dx = this.ball.x - player.x;
+    let dz = this.ball.z - player.y;
+    let length = Math.hypot(dx, dz);
+
+    if (length < 0.0001) {
+      dx = Math.sin(player.rotation);
+      dz = Math.cos(player.rotation);
+      length = Math.hypot(dx, dz) || 1;
+    }
+
+    dx /= length;
+    dz /= length;
+
+    const moveTowardBall = player.vx * dx + player.vz * dz;
+
+    // Não permite que o cliente invente um contato sem aproximação,
+    // exceto quando a bola já está se movendo para o jogador.
+    const ballTowardPlayer =
+      -(this.ball.vx * dx + this.ball.vz * dz);
+
+    if (
+      moveTowardBall < MIN_CONTACT_SPEED &&
+      ballTowardPlayer < MIN_CONTACT_SPEED
+    ) {
+      client.send("ball-contact-rejected", {
+        sequence,
+        revision: this.ball.revision,
+        reason: "no-approach"
+      });
+      return;
+    }
+
+    this.lastContactAt[client.sessionId] = now;
+
+    const relativeSpeed = Math.max(
+      0,
+      moveTowardBall + ballTowardPlayer
+    );
+
+    const impulse = clamp(
+      relativeSpeed * 0.65,
+      0.25,
+      MAX_CONTACT_IMPULSE
+    );
+
+    this.ball.vx += dx * impulse;
+    this.ball.vz += dz * impulse;
+
+    this.ball.vx = clamp(
+      this.ball.vx,
+      -MAX_BALL_SPEED,
+      MAX_BALL_SPEED
+    );
+
+    this.ball.vz = clamp(
+      this.ball.vz,
+      -MAX_BALL_SPEED,
+      MAX_BALL_SPEED
+    );
+
+    this.ball.lastTouch = client.sessionId;
+    this.ball.revision++;
+
+    const confirmation: ContactData = {
+      sessionId: client.sessionId,
+      sequence,
+      revision: this.ball.revision,
+      x: this.ball.x,
+      y: this.ball.y,
+      z: this.ball.z,
+      vx: this.ball.vx,
+      vy: this.ball.vy,
+      vz: this.ball.vz
+    };
+
+    client.send("ball-contact-confirmed", confirmation);
+    this.broadcast("ball-contact-confirmed", confirmation);
+    this.broadcastBall();
   }
 
   private handleKick(
@@ -526,12 +717,6 @@ class MatchRoom extends Room {
     const last = this.lastKickAt[client.sessionId] || 0;
 
     if (now - last < KICK_COOLDOWN_MS) return;
-    this.lastKickAt[client.sessionId] = now;
-
-    const dx = finite(data.dx);
-    const dy = finite(data.dy);
-    const dz = finite(data.dz, -1);
-    const power = clamp(finite(data.power, 0.5), 0.22, 1);
 
     const horizontalDistance = distance2D(
       player.x,
@@ -540,8 +725,14 @@ class MatchRoom extends Room {
       this.ball.z
     );
 
-    // O chute precisa ocorrer perto do jogador.
-    if (horizontalDistance > PLAYER_BALL_DISTANCE + 0.5) {
+    if (
+      horizontalDistance >
+      PLAYER_BALL_DISTANCE + KICK_DISTANCE_ALLOWANCE
+    ) {
+      client.send("kick-rejected", {
+        reason: "too-far",
+        revision: this.ball.revision
+      });
       return;
     }
 
@@ -549,11 +740,25 @@ class MatchRoom extends Room {
       this.ball.y - BALL_RADIUS > PLAYER_HEIGHT ||
       this.ball.y + BALL_RADIUS < 0
     ) {
+      client.send("kick-rejected", {
+        reason: "height",
+        revision: this.ball.revision
+      });
       return;
     }
 
+    const dx = finite(data.dx);
+    const dy = finite(data.dy);
+    const dz = finite(data.dz, -1);
+    const power = clamp(finite(data.power, 0.5), 0.22, MAX_KICK_POWER);
+
     const length = Math.hypot(dx, dy, dz);
     if (length < 0.001) return;
+
+    lastKickAtForPlayer:
+    {
+      this.lastKickAt[client.sessionId] = now;
+    }
 
     const nx = dx / length;
     const ny = dy / length;
@@ -561,31 +766,47 @@ class MatchRoom extends Room {
 
     const speed = 11 + power * 19;
 
+    // O chute aplica impulso na velocidade existente,
+    // em vez de trocar a bola por uma nova velocidade.
+    this.ball.vx += nx * speed;
+    this.ball.vy += Math.max(1.5, ny * speed + 2.5);
+    this.ball.vz += nz * speed;
+
     this.ball.vx = clamp(
-      nx * speed,
+      this.ball.vx,
       -MAX_BALL_SPEED,
       MAX_BALL_SPEED
     );
 
     this.ball.vy = clamp(
-      Math.max(1.5, ny * speed + 2.5),
+      this.ball.vy,
       -MAX_BALL_SPEED,
       MAX_BALL_SPEED
     );
 
     this.ball.vz = clamp(
-      nz * speed,
+      this.ball.vz,
       -MAX_BALL_SPEED,
       MAX_BALL_SPEED
     );
 
+    this.ball.lastTouch = client.sessionId;
     this.ball.lastGoal = "";
+    this.ball.revision++;
 
-    this.broadcast("kick-confirmed", {
+    const result = {
       sessionId: client.sessionId,
-      power
-    });
+      power,
+      revision: this.ball.revision,
+      x: this.ball.x,
+      y: this.ball.y,
+      z: this.ball.z,
+      vx: this.ball.vx,
+      vy: this.ball.vy,
+      vz: this.ball.vz
+    };
 
+    this.broadcast("kick-confirmed", result);
     this.broadcastBall();
   }
 
@@ -596,12 +817,16 @@ class MatchRoom extends Room {
       this.goalResetTimer -= dt;
 
       if (this.goalResetTimer <= 0) {
+        const previous = this.ball;
+
         this.ball = {
           ...createInitialBall(),
-          score: this.ball.score,
-          goalsA: this.ball.goalsA,
-          goalsB: this.ball.goalsB,
-          lastGoal: this.ball.lastGoal
+          score: previous.score,
+          goalsA: previous.goalsA,
+          goalsB: previous.goalsB,
+          lastGoal: previous.lastGoal,
+          lastTouch: previous.lastTouch,
+          revision: previous.revision + 1
         };
 
         this.broadcastBall();
@@ -626,9 +851,6 @@ class MatchRoom extends Room {
       const nextY = b.y + b.vy * step;
       const nextZ = b.z + b.vz * step;
 
-      // Detecta o caminho da esfera entre posições.
-      // Evita que uma bola rápida passe pelo jogador
-      // entre duas atualizações do servidor.
       this.resolveBallSweptCollision(
         oldX,
         oldY,
@@ -785,6 +1007,9 @@ class MatchRoom extends Room {
 
         b.vx += impulse * nx;
         b.vz += impulse * nz;
+
+        b.lastTouch = "";
+        b.revision++;
       }
     }
   }
@@ -824,6 +1049,9 @@ class MatchRoom extends Room {
 
         b.vx += impulse * nx;
         b.vz += impulse * nz;
+
+        b.lastTouch = "";
+        b.revision++;
       }
 
       b.vx = clamp(b.vx, -MAX_BALL_SPEED, MAX_BALL_SPEED);
@@ -847,6 +1075,8 @@ class MatchRoom extends Room {
     this.ball.vx = 0;
     this.ball.vy = 0;
     this.ball.vz = 0;
+    this.ball.lastTouch = "";
+    this.ball.revision++;
 
     this.goalResetTimer = GOAL_RESET_SECONDS;
 
@@ -866,6 +1096,10 @@ class MatchRoom extends Room {
   private resetMatch() {
     this.ball = createInitialBall();
     this.goalResetTimer = 0;
+
+    this.lastKickAt = {};
+    this.lastContactAt = {};
+    this.lastContactSequence = {};
 
     this.broadcast("score-state", {
       score: 0,
@@ -911,6 +1145,8 @@ class MatchRoom extends Room {
   onLeave(client: Client) {
     delete this.players[client.sessionId];
     delete this.lastKickAt[client.sessionId];
+    delete this.lastContactAt[client.sessionId];
+    delete this.lastContactSequence[client.sessionId];
 
     this.broadcast("players", this.players);
 
