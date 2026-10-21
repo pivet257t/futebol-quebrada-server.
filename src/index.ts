@@ -1,3 +1,4 @@
+
 import { Server, Room, Client, matchMaker } from "colyseus";
 import { WebSocketTransport } from "@colyseus/ws-transport";
 import express from "express";
@@ -68,68 +69,104 @@ class MatchRoom extends Room {
       createdAt: Date.now()
     });
 
-    this.onMessage("move", (client: Client, data: Partial<PlayerData>) => {
-      const player = this.players[client.sessionId];
-      if (!player || !data || typeof data !== "object") return;
+    this.onMessage(
+      "move",
+      (client: Client, data: Partial<PlayerData>) => {
+        const player = this.players[client.sessionId];
 
-      if (typeof data.x === "number" && Number.isFinite(data.x)) {
-        player.x = Math.max(-1000, Math.min(1000, data.x));
+        if (!player || !data || typeof data !== "object") return;
+
+        if (typeof data.x === "number" && Number.isFinite(data.x)) {
+          player.x = Math.max(-1000, Math.min(1000, data.x));
+        }
+
+        if (typeof data.y === "number" && Number.isFinite(data.y)) {
+          player.y = Math.max(-1000, Math.min(1000, data.y));
+        }
+
+        if (
+          typeof data.rotation === "number" &&
+          Number.isFinite(data.rotation)
+        ) {
+          player.rotation = data.rotation;
+        }
+
+        this.broadcast("players", this.players);
       }
+    );
 
-      if (typeof data.y === "number" && Number.isFinite(data.y)) {
-        player.y = Math.max(-1000, Math.min(1000, data.y));
+    this.onMessage(
+      "kick",
+      (client: Client, data: Partial<KickData>) => {
+        if (!this.players[client.sessionId]) return;
+        if (!data || typeof data !== "object") return;
+
+        const dx = Number(data.dx);
+        const dy = Number(data.dy);
+        const dz = Number(data.dz);
+        const power = Number(data.power);
+
+        const kick: KickData = {
+          dx: Number.isFinite(dx)
+            ? Math.max(-1, Math.min(1, dx))
+            : 0,
+          dy: Number.isFinite(dy)
+            ? Math.max(-1, Math.min(1, dy))
+            : 0,
+          dz: Number.isFinite(dz)
+            ? Math.max(-1, Math.min(1, dz))
+            : -1,
+          power: Number.isFinite(power)
+            ? Math.max(0.22, Math.min(1, power))
+            : 0.5
+        };
+
+        // Encaminha o chute do jogador 2 ao anfitrião,
+        // que é responsável por simular a física da bola.
+        if (client.sessionId !== this.hostSessionId) {
+          const host = this.clients.find(
+            (c) => c.sessionId === this.hostSessionId
+          );
+
+          if (host) {
+            host.send("kick", kick);
+          }
+        }
+
+        // Mantém o evento disponível para o outro jogador,
+        // sem enviá-lo de volta a quem chutou.
+        this.broadcast("kick", kick, { except: client });
       }
+    );
 
-      if (
-        typeof data.rotation === "number" &&
-        Number.isFinite(data.rotation)
-      ) {
-        player.rotation = data.rotation;
+    this.onMessage(
+      "ball-state",
+      (client: Client, data: Partial<BallState>) => {
+        // Só o anfitrião pode publicar o estado da bola.
+        if (client.sessionId !== this.hostSessionId) return;
+        if (!data || typeof data !== "object") return;
+
+        const keys: (keyof BallState)[] = [
+          "x", "y", "z", "vx", "vy", "vz", "rx", "rz"
+        ];
+
+        const ball = {} as BallState;
+
+        for (const key of keys) {
+          const value = data[key];
+
+          if (typeof value !== "number" || !Number.isFinite(value)) {
+            return;
+          }
+
+          ball[key] = Math.max(-10000, Math.min(10000, value));
+        }
+
+        this.lastBallState = ball;
+
+        this.broadcast("ball-state", ball, { except: client });
       }
-
-      this.broadcast("players", this.players);
-    });
-
-    this.onMessage("kick", (client: Client, data: Partial<KickData>) => {
-      if (!this.players[client.sessionId]) return;
-      if (!data || typeof data !== "object") return;
-
-      const dx = Number(data.dx);
-      const dy = Number(data.dy);
-      const dz = Number(data.dz);
-      const power = Number(data.power);
-
-      const kick: KickData = {
-        dx: Number.isFinite(dx) ? Math.max(-1, Math.min(1, dx)) : 0,
-        dy: Number.isFinite(dy) ? Math.max(-1, Math.min(1, dy)) : 0,
-        dz: Number.isFinite(dz) ? Math.max(-1, Math.min(1, dz)) : -1,
-        power: Number.isFinite(power)
-          ? Math.max(0.22, Math.min(1, power))
-          : 0.5
-      };
-
-      this.broadcast("kick", kick, { except: client });
-    });
-
-    this.onMessage("ball-state", (client: Client, data: Partial<BallState>) => {
-      if (client.sessionId !== this.hostSessionId) return;
-      if (!data || typeof data !== "object") return;
-
-      const keys: (keyof BallState)[] = [
-        "x", "y", "z", "vx", "vy", "vz", "rx", "rz"
-      ];
-
-      const ball = {} as BallState;
-
-      for (const key of keys) {
-        const value = data[key];
-        if (typeof value !== "number" || !Number.isFinite(value)) return;
-        ball[key] = Math.max(-10000, Math.min(10000, value));
-      }
-
-      this.lastBallState = ball;
-      this.broadcast("ball-state", ball, { except: client });
-    });
+    );
   }
 
   onJoin(client: Client) {
@@ -150,7 +187,12 @@ class MatchRoom extends Room {
       client.send("ball-state", this.lastBallState);
     }
 
-    console.log("Jogador entrou:", client.sessionId);
+    console.log(
+      "Jogador entrou:",
+      client.sessionId,
+      "Anfitrião:",
+      this.hostSessionId
+    );
   }
 
   onLeave(client: Client) {
@@ -184,7 +226,9 @@ function createCode(): string {
       Math.floor(100000 + Math.random() * 900000)
     );
 
-    if (!roomCodes.has(code)) return code;
+    if (!roomCodes.has(code)) {
+      return code;
+    }
   }
 
   throw new Error("Não foi possível gerar um código de sala.");
@@ -248,7 +292,12 @@ app.post("/api/rooms/join", (req, res) => {
   });
 });
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((
+  err: unknown,
+  _req: express.Request,
+  res: express.Response,
+  _next: express.NextFunction
+) => {
   console.error("Erro HTTP:", err);
 
   if (!res.headersSent) {
