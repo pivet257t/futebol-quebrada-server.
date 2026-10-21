@@ -1,5 +1,5 @@
 
-import { Server } from "colyseus";
+import { Server, Room, Client } from "colyseus";
 import { WebSocketTransport } from "@colyseus/ws-transport";
 import express from "express";
 import http from "http";
@@ -8,8 +8,29 @@ const app = express();
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", game: "Futebol de Quebrada" });
+  res.json({
+    status: "ok",
+    game: "Futebol de Quebrada"
+  });
 });
+
+class MatchRoom extends Room {
+  maxClients = 2;
+
+  onCreate() {
+    this.setMetadata({
+      createdAt: Date.now()
+    });
+  }
+
+  onJoin(client: Client) {
+    console.log("Jogador entrou:", client.sessionId);
+  }
+
+  onLeave(client: Client) {
+    console.log("Jogador saiu:", client.sessionId);
+  }
+}
 
 const httpServer = http.createServer(app);
 
@@ -19,24 +40,10 @@ const gameServer = new Server({
   })
 });
 
-gameServer.define("match", class extends (await import("@colyseus/core")).Room {
-  maxClients = 2;
-
-  onCreate() {
-    this.setMetadata({ createdAt: Date.now() });
-  }
-
-  onJoin(client) {
-    console.log("Jogador entrou:", client.sessionId);
-  }
-
-  onLeave(client) {
-    console.log("Jogador saiu:", client.sessionId);
-  }
-});
+gameServer.define("match", MatchRoom);
 
 const port = Number(process.env.PORT || 2567);
 
 gameServer.listen(port).then(() => {
-  console.log(`Servidor iniciado na porta ${port}`);
+  console.log("Servidor iniciado na porta", port);
 });
