@@ -113,12 +113,7 @@ app.get("/health", (_req, res) => {
 
 /*
  * CAMPO ATUAL — v40 / campo completo.
- *
- * O campo antigo tinha 36 x 60 unidades.
- * O campo novo usa 68 x 140 unidades.
- *
- * Todas as colisões, limites da bola, limites dos jogadores
- * e detecção de gols usam as dimensões do campo novo.
+ * Todas as colisões usam o campo de 68 x 140 unidades.
  */
 const FIELD_WIDTH = 68;
 const FIELD_LENGTH = 140;
@@ -162,13 +157,6 @@ const TRAJECTORY_LEASE_MS = 750;
 const MAX_TRAJECTORY_SPEED = 35;
 const BALL_MOVE_MIN_INTERVAL_MS = 20;
 
-/*
- * A bola pode ultrapassar a linha do campo para entrar no gol,
- * mas não pode ficar presa na parede do campo antigo.
- *
- * A margem de profundidade permite que ela atravesse a linha
- * final dentro da abertura do gol.
- */
 const BALL_FIELD_MARGIN = 0.75;
 const BALL_GOAL_BACK_MARGIN = GOAL_DEPTH + BALL_RADIUS + 0.5;
 const BALL_SIDE_MARGIN = 2;
@@ -356,10 +344,6 @@ class MatchRoom extends Room {
     let nextY = y;
     let nextZ = z;
 
-    /*
-     * Nas laterais, a bola não atravessa a linha lateral.
-     * A abertura de gol só existe nas duas extremidades do campo.
-     */
     const sideLimit = FIELD_HALF_WIDTH - BALL_RADIUS;
 
     nextX = clamp(nextX, -sideLimit, sideLimit);
@@ -369,10 +353,6 @@ class MatchRoom extends Room {
       GOAL_HEIGHT + BALL_TOP_MARGIN
     );
 
-    /*
-     * Permite a bola sair pela linha final somente dentro da
-     * abertura do gol. Fora da trave, ela bate na linha final.
-     */
     const insideGoal = this.isInsideGoalOpening(nextX, nextY);
     const minZ = insideGoal
       ? -FIELD_HALF_LENGTH - BALL_GOAL_BACK_MARGIN
@@ -492,10 +472,6 @@ class MatchRoom extends Room {
     this.broadcast("players", this.players);
   }
 
-  /*
-   * A posição da bola é prevista pelo HTML e compartilhada pelo servidor.
-   * O servidor agora valida usando as dimensões do campo novo.
-   */
   private handleBallMove(
     client: Client,
     data: Partial<BallMoveData>
@@ -631,10 +607,6 @@ class MatchRoom extends Room {
       b.trajectoryUntil = now + TRAJECTORY_LEASE_MS;
     }
 
-    /*
-     * Sincroniza a bola com a posição válida dentro do campo atual.
-     * A posição não é limitada às antigas coordenadas ±18 e ±30.
-     */
     b.x = clampedPosition.x;
     b.y = clampedPosition.y;
     b.z = clampedPosition.z;
@@ -1155,13 +1127,6 @@ class MatchRoom extends Room {
     );
   }
 
-  /*
-   * O HTML calcula a física contínua da bola.
-   * O servidor detecta gols com as dimensões atuais do campo.
-   *
-   * A linha de gol fica em z = +/-70, não mais em +/-30.
-   * Só registra gol quando a bola entra pela abertura da trave.
-   */
   private simulate(_dt: number) {
     if (this.goalResetTimer > 0) {
       this.goalResetTimer -= SIMULATION_MS / 1000;
@@ -1218,10 +1183,6 @@ class MatchRoom extends Room {
       return;
     }
 
-    /*
-     * Segurança extra: se a bola for enviada para fora da abertura
-     * do gol, o servidor a mantém dentro das linhas do campo.
-     */
     if (!insideGoalWidth) {
       const sideLimit = FIELD_HALF_WIDTH - BALL_RADIUS;
 
@@ -1246,10 +1207,6 @@ class MatchRoom extends Room {
       }
     }
 
-    /*
-     * A bola não fica presa no limite antigo.
-     * Quando está dentro da abertura, pode avançar pelo túnel do gol.
-     */
     if (this.isBallInsideGoalTunnel(b.z) && insideGoalWidth && lowEnough) {
       return;
     }
