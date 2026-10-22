@@ -1,4 +1,3 @@
-
 import { Server, Room, Client, matchMaker } from "colyseus";
 import { WebSocketTransport } from "@colyseus/ws-transport";
 import express from "express";
@@ -100,14 +99,37 @@ app.get("/health", (_req, res) => {
     physics: "client-predicted",
     prediction: true,
     sharedBall: true,
-    ballMoveSync: true
+    ballMoveSync: true,
+    field: {
+      width: FIELD_WIDTH,
+      length: FIELD_LENGTH,
+      halfWidth: FIELD_HALF_WIDTH,
+      halfLength: FIELD_HALF_LENGTH,
+      goalHalfWidth: GOAL_HALF_WIDTH,
+      goalHeight: GOAL_HEIGHT
+    }
   });
 });
 
-const FIELD_HALF_WIDTH = 18;
-const FIELD_HALF_LENGTH = 30;
-const GOAL_HALF_WIDTH = 4.25;
+/*
+ * CAMPO ATUAL — v40 / campo completo.
+ *
+ * O campo antigo tinha 36 x 60 unidades.
+ * O campo novo usa 68 x 140 unidades.
+ *
+ * Todas as colisões, limites da bola, limites dos jogadores
+ * e detecção de gols usam as dimensões do campo novo.
+ */
+const FIELD_WIDTH = 68;
+const FIELD_LENGTH = 140;
+
+const FIELD_HALF_WIDTH = FIELD_WIDTH / 2;
+const FIELD_HALF_LENGTH = FIELD_LENGTH / 2;
+
+const GOAL_WIDTH = 8.5;
+const GOAL_HALF_WIDTH = GOAL_WIDTH / 2;
 const GOAL_HEIGHT = 3.2;
+const GOAL_DEPTH = 2.2;
 
 const BALL_RADIUS = 0.25;
 const PLAYER_RADIUS = 0.42;
@@ -139,6 +161,18 @@ const MAX_KICK_POWER = 1;
 const TRAJECTORY_LEASE_MS = 750;
 const MAX_TRAJECTORY_SPEED = 35;
 const BALL_MOVE_MIN_INTERVAL_MS = 20;
+
+/*
+ * A bola pode ultrapassar a linha do campo para entrar no gol,
+ * mas não pode ficar presa na parede do campo antigo.
+ *
+ * A margem de profundidade permite que ela atravesse a linha
+ * final dentro da abertura do gol.
+ */
+const BALL_FIELD_MARGIN = 0.75;
+const BALL_GOAL_BACK_MARGIN = GOAL_DEPTH + BALL_RADIUS + 0.5;
+const BALL_SIDE_MARGIN = 2;
+const BALL_TOP_MARGIN = 3;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -201,6 +235,8 @@ class MatchRoom extends Room {
   onCreate() {
     this.setMetadata({
       game: "Futebol de Quebrada",
+      fieldWidth: FIELD_WIDTH,
+      fieldLength: FIELD_LENGTH,
       createdAt: Date.now()
     });
 
@@ -278,6 +314,82 @@ class MatchRoom extends Room {
     }, SIMULATION_MS);
   }
 
+  private clampPlayerToField(x: number, z: number) {
+    return {
+      x: clamp(
+        x,
+        -FIELD_HALF_WIDTH + PLAYER_RADIUS,
+        FIELD_HALF_WIDTH - PLAYER_RADIUS
+      ),
+      z: clamp(
+        z,
+        -FIELD_HALF_LENGTH + PLAYER_RADIUS,
+        FIELD_HALF_LENGTH - PLAYER_RADIUS
+      )
+    };
+  }
+
+  private isInsideGoalOpening(x: number, y: number): boolean {
+    return (
+      Math.abs(x) <= GOAL_HALF_WIDTH - BALL_RADIUS * 0.25 &&
+      y - BALL_RADIUS < GOAL_HEIGHT &&
+      y + BALL_RADIUS > 0
+    );
+  }
+
+  private isBallInsideGoalTunnel(z: number): boolean {
+    return (
+      z < -FIELD_HALF_LENGTH &&
+      z >= -FIELD_HALF_LENGTH - BALL_GOAL_BACK_MARGIN
+    ) || (
+      z > FIELD_HALF_LENGTH &&
+      z <= FIELD_HALF_LENGTH + BALL_GOAL_BACK_MARGIN
+    );
+  }
+
+  private clampBallToCurrentField(
+    x: number,
+    y: number,
+    z: number
+  ) {
+    let nextX = x;
+    let nextY = y;
+    let nextZ = z;
+
+    /*
+     * Nas laterais, a bola não atravessa a linha lateral.
+     * A abertura de gol só existe nas duas extremidades do campo.
+     */
+    const sideLimit = FIELD_HALF_WIDTH - BALL_RADIUS;
+
+    nextX = clamp(nextX, -sideLimit, sideLimit);
+    nextY = clamp(
+      nextY,
+      BALL_RADIUS,
+      GOAL_HEIGHT + BALL_TOP_MARGIN
+    );
+
+    /*
+     * Permite a bola sair pela linha final somente dentro da
+     * abertura do gol. Fora da trave, ela bate na linha final.
+     */
+    const insideGoal = this.isInsideGoalOpening(nextX, nextY);
+    const minZ = insideGoal
+      ? -FIELD_HALF_LENGTH - BALL_GOAL_BACK_MARGIN
+      : -FIELD_HALF_LENGTH - BALL_FIELD_MARGIN;
+    const maxZ = insideGoal
+      ? FIELD_HALF_LENGTH + BALL_GOAL_BACK_MARGIN
+      : FIELD_HALF_LENGTH + BALL_FIELD_MARGIN;
+
+    nextZ = clamp(nextZ, minZ, maxZ);
+
+    return {
+      x: nextX,
+      y: nextY,
+      z: nextZ
+    };
+  }
+
   private handleMove(
     client: Client,
     data: Partial<PlayerData>
@@ -319,17 +431,9 @@ class MatchRoom extends Room {
       nextZ += (dz / requestedDistance) * allowed;
     }
 
-    nextX = clamp(
-      nextX,
-      -FIELD_HALF_WIDTH + PLAYER_RADIUS,
-      FIELD_HALF_WIDTH - PLAYER_RADIUS
-    );
-
-    nextZ = clamp(
-      nextZ,
-      -FIELD_HALF_LENGTH + PLAYER_RADIUS,
-      FIELD_HALF_LENGTH - PLAYER_RADIUS
-    );
+    const fieldPosition = this.clampPlayerToField(nextX, nextZ);
+    nextX = fieldPosition.x;
+    nextZ = fieldPosition.z;
 
     const ballBlocked = this.resolvePlayerBallMovement(
       player,
@@ -389,9 +493,8 @@ class MatchRoom extends Room {
   }
 
   /*
-   * A bola usa posição prevista pelo HTML.
-   * O servidor compartilha a posição e impede que dois clientes
-   * sobrescrevam continuamente a trajetória um do outro.
+   * A posição da bola é prevista pelo HTML e compartilhada pelo servidor.
+   * O servidor agora valida usando as dimensões do campo novo.
    */
   private handleBallMove(
     client: Client,
@@ -426,22 +529,24 @@ class MatchRoom extends Room {
 
     const b = this.ball;
 
-    const requestedX = clamp(
-      finite(data.x, b.x),
-      -FIELD_HALF_WIDTH - 2,
-      FIELD_HALF_WIDTH + 2
-    );
+    const requestedX = finite(data.x, b.x);
+    const requestedY = finite(data.y, b.y);
+    const requestedZ = finite(data.z, b.z);
 
-    const requestedY = clamp(
-      finite(data.y, b.y),
-      BALL_RADIUS,
-      GOAL_HEIGHT + 3
-    );
+    const action = String(data.action || "move");
 
-    const requestedZ = clamp(
-      finite(data.z, b.z),
-      -FIELD_HALF_LENGTH - 3,
-      FIELD_HALF_LENGTH + 3
+    if (
+      action !== "move" &&
+      action !== "kick" &&
+      action !== "contact"
+    ) {
+      return;
+    }
+
+    const clampedPosition = this.clampBallToCurrentField(
+      requestedX,
+      requestedY,
+      requestedZ
     );
 
     const requestedVX = clamp(
@@ -462,35 +567,20 @@ class MatchRoom extends Room {
       MAX_BALL_SPEED
     );
 
-    const action = String(data.action || "move");
-
-    if (
-      action !== "move" &&
-      action !== "kick" &&
-      action !== "contact"
-    ) {
-      return;
-    }
-
     const playerDistance = distance2D(
       player.x,
       player.y,
-      requestedX,
-      requestedZ
+      clampedPosition.x,
+      clampedPosition.z
     );
 
-    const ownsTrajectory =
-      b.trajectoryOwner === sessionId;
+    const ownsTrajectory = b.trajectoryOwner === sessionId;
 
     const otherOwnsRecentTrajectory =
       Boolean(b.trajectoryOwner) &&
       b.trajectoryOwner !== sessionId &&
       now <= b.trajectoryUntil;
 
-    /*
-     * Se outro jogador ainda tem a trajetória ativa,
-     * rejeita a posição concorrente e devolve o estado atual.
-     */
     if (otherOwnsRecentTrajectory) {
       client.send("trajectory-correction", {
         reason: "newer-server-trajectory",
@@ -507,10 +597,6 @@ class MatchRoom extends Room {
 
     const nearlyStill = serverBallSpeed < 0.35;
 
-    /*
-     * Uma bola parada não pode ser reposicionada remotamente
-     * por alguém que esteja longe dela.
-     */
     if (
       nearlyStill &&
       !ownsTrajectory &&
@@ -524,10 +610,6 @@ class MatchRoom extends Room {
       return;
     }
 
-    /*
-     * Um contato só pode assumir a trajetória quando o jogador
-     * está próximo da bola.
-     */
     if (
       action === "contact" &&
       playerDistance <=
@@ -537,10 +619,6 @@ class MatchRoom extends Room {
       b.trajectoryUntil = now + TRAJECTORY_LEASE_MS;
     }
 
-    /*
-     * Se a bola está se movendo e não tem responsável ativo,
-     * o primeiro pacote aceito passa a controlar a trajetória.
-     */
     if (
       !b.trajectoryOwner &&
       serverBallSpeed >= 0.35
@@ -549,21 +627,17 @@ class MatchRoom extends Room {
       b.trajectoryUntil = now + TRAJECTORY_LEASE_MS;
     }
 
-    /*
-     * O dono renova sua autorização a cada pacote válido,
-     * mantendo a trajetória protegida enquanto envia atualizações.
-     */
     if (b.trajectoryOwner === sessionId) {
       b.trajectoryUntil = now + TRAJECTORY_LEASE_MS;
     }
 
     /*
-     * Atualização direta da posição compartilhada.
-     * Não simula a trajetória novamente no servidor.
+     * Sincroniza a bola com a posição válida dentro do campo atual.
+     * A posição não é limitada às antigas coordenadas ±18 e ±30.
      */
-    b.x = requestedX;
-    b.y = requestedY;
-    b.z = requestedZ;
+    b.x = clampedPosition.x;
+    b.y = clampedPosition.y;
+    b.z = clampedPosition.z;
 
     b.vx = requestedVX;
     b.vy = requestedVY;
@@ -672,17 +746,11 @@ class MatchRoom extends Room {
       z = b.z - nz * PLAYER_BALL_DISTANCE;
     }
 
+    const position = this.clampPlayerToField(x, z);
+
     return {
-      x: clamp(
-        x,
-        -FIELD_HALF_WIDTH + PLAYER_RADIUS,
-        FIELD_HALF_WIDTH - PLAYER_RADIUS
-      ),
-      z: clamp(
-        z,
-        -FIELD_HALF_LENGTH + PLAYER_RADIUS,
-        FIELD_HALF_LENGTH - PLAYER_RADIUS
-      )
+      x: position.x,
+      z: position.z
     };
   }
 
@@ -722,17 +790,9 @@ class MatchRoom extends Room {
         x = other.x + (dx / distance) * PLAYER_PLAYER_DISTANCE;
         z = other.y + (dz / distance) * PLAYER_PLAYER_DISTANCE;
 
-        x = clamp(
-          x,
-          -FIELD_HALF_WIDTH + PLAYER_RADIUS,
-          FIELD_HALF_WIDTH - PLAYER_RADIUS
-        );
-
-        z = clamp(
-          z,
-          -FIELD_HALF_LENGTH + PLAYER_RADIUS,
-          FIELD_HALF_LENGTH - PLAYER_RADIUS
-        );
+        const position = this.clampPlayerToField(x, z);
+        x = position.x;
+        z = position.z;
 
         collided = true;
       }
@@ -1097,7 +1157,10 @@ class MatchRoom extends Room {
 
   /*
    * O HTML calcula a física contínua da bola.
-   * O servidor verifica gols e mantém a pontuação compartilhada.
+   * O servidor detecta gols com as dimensões atuais do campo.
+   *
+   * A linha de gol fica em z = +/-70, não mais em +/-30.
+   * Só registra gol quando a bola entra pela abertura da trave.
    */
   private simulate(_dt: number) {
     if (this.goalResetTimer > 0) {
@@ -1124,13 +1187,23 @@ class MatchRoom extends Room {
 
     const b = this.ball;
 
-    const insideGoalWidth = Math.abs(b.x) <= GOAL_HALF_WIDTH;
-    const lowEnough = b.y <= GOAL_HEIGHT;
+    const insideGoalWidth =
+      Math.abs(b.x) <= GOAL_HALF_WIDTH - BALL_RADIUS * 0.25;
+
+    const lowEnough =
+      b.y - BALL_RADIUS < GOAL_HEIGHT &&
+      b.y + BALL_RADIUS > 0;
+
+    const crossedNegativeGoalLine =
+      b.z < -FIELD_HALF_LENGTH;
+
+    const crossedPositiveGoalLine =
+      b.z > FIELD_HALF_LENGTH;
 
     if (
       insideGoalWidth &&
       lowEnough &&
-      b.z < -FIELD_HALF_LENGTH
+      crossedNegativeGoalLine
     ) {
       this.registerGoal("A");
       return;
@@ -1139,9 +1212,45 @@ class MatchRoom extends Room {
     if (
       insideGoalWidth &&
       lowEnough &&
-      b.z > FIELD_HALF_LENGTH
+      crossedPositiveGoalLine
     ) {
       this.registerGoal("B");
+      return;
+    }
+
+    /*
+     * Segurança extra: se a bola for enviada para fora da abertura
+     * do gol, o servidor a mantém dentro das linhas do campo.
+     */
+    if (!insideGoalWidth) {
+      const sideLimit = FIELD_HALF_WIDTH - BALL_RADIUS;
+
+      if (b.x > sideLimit) {
+        b.x = sideLimit;
+        if (b.vx > 0) b.vx = -Math.abs(b.vx) * BOUNCE;
+        b.revision++;
+      } else if (b.x < -sideLimit) {
+        b.x = -sideLimit;
+        if (b.vx < 0) b.vx = Math.abs(b.vx) * BOUNCE;
+        b.revision++;
+      }
+
+      if (b.z > FIELD_HALF_LENGTH) {
+        b.z = FIELD_HALF_LENGTH - BALL_RADIUS;
+        if (b.vz > 0) b.vz = -Math.abs(b.vz) * BOUNCE;
+        b.revision++;
+      } else if (b.z < -FIELD_HALF_LENGTH) {
+        b.z = -FIELD_HALF_LENGTH + BALL_RADIUS;
+        if (b.vz < 0) b.vz = Math.abs(b.vz) * BOUNCE;
+        b.revision++;
+      }
+    }
+
+    /*
+     * A bola não fica presa no limite antigo.
+     * Quando está dentro da abertura, pode avançar pelo túnel do gol.
+     */
+    if (this.isBallInsideGoalTunnel(b.z) && insideGoalWidth && lowEnough) {
       return;
     }
   }
@@ -1165,6 +1274,9 @@ class MatchRoom extends Room {
     this.ball.vx = 0;
     this.ball.vy = 0;
     this.ball.vz = 0;
+
+    this.ball.rx = 0;
+    this.ball.rz = 0;
 
     this.ball.lastTouch = "";
     this.ball.trajectoryOwner = "";
@@ -1236,7 +1348,14 @@ class MatchRoom extends Room {
       matchOver: false
     });
 
-    console.log("Jogador entrou:", client.sessionId);
+    console.log(
+      "Jogador entrou:",
+      client.sessionId,
+      "| Campo:",
+      FIELD_WIDTH,
+      "x",
+      FIELD_LENGTH
+    );
   }
 
   onLeave(client: Client) {
@@ -1295,13 +1414,20 @@ app.post("/api/rooms/create", async (_req, res) => {
   try {
     code = createCode();
 
-    const room = await matchMaker.createRoom("match", { code });
+    const room = await matchMaker.createRoom("match", {
+      code,
+      fieldWidth: FIELD_WIDTH,
+      fieldLength: FIELD_LENGTH
+    });
+
     roomCodes.set(code, room.roomId);
 
     res.status(201).json({
       status: "ok",
       code,
       roomId: room.roomId,
+      fieldWidth: FIELD_WIDTH,
+      fieldLength: FIELD_LENGTH,
       message: "Sala criada"
     });
   } catch (error) {
@@ -1342,7 +1468,9 @@ app.post("/api/rooms/join", (req, res) => {
   res.json({
     status: "ok",
     code,
-    roomId
+    roomId,
+    fieldWidth: FIELD_WIDTH,
+    fieldLength: FIELD_LENGTH
   });
 });
 
@@ -1366,7 +1494,16 @@ const port = Number(process.env.PORT || 2567);
 
 gameServer.listen(port)
   .then(() => {
-    console.log("Servidor iniciado na porta", port);
+    console.log(
+      "Servidor iniciado na porta",
+      port,
+      "| Campo atual:",
+      FIELD_WIDTH,
+      "x",
+      FIELD_LENGTH,
+      "| Gols em z = +/-",
+      FIELD_HALF_LENGTH
+    );
   })
   .catch((error: unknown) => {
     console.error("Falha ao iniciar o servidor:", error);
